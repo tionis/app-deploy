@@ -1,0 +1,40 @@
+---
+name: Deploy an app through Gandalf
+description: >-
+  Ask the Gandalf gateway to run a pushed image digest on the node an app is
+  placed on, and wait until the node reports it live or rolled back.
+
+inputs:
+  service:
+    description: The app's service id in Gandalf (a web_app with a deploy block).
+    required: true
+  image:
+    description: >-
+      The pushed image as repository@sha256:digest, e.g. from the push step's
+      digest output. Only digests of the app's declared repository deploy.
+    required: true
+  gateway:
+    description: The Gandalf gateway.
+    required: false
+    default: https://gandalf.tionis.dev
+  timeout:
+    description: Seconds to wait for the node's result.
+    required: false
+    default: "900"
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy through Gandalf
+      shell: bash
+      env:
+        APP_DEPLOY_SERVICE: ${{ inputs.service }}
+        APP_DEPLOY_IMAGE: ${{ inputs.image }}
+        APP_DEPLOY_GATEWAY: ${{ inputs.gateway }}
+        APP_DEPLOY_TIMEOUT: ${{ inputs.timeout }}
+        APP_DEPLOY_REVISION: ${{ github.sha }}
+        APP_DEPLOY_RUN: ${{ github.repository }}:${{ github.run_id }}:${{ github.run_attempt }}
+      run: |
+        set -euo pipefail
+        # Forgejo and GitHub name the action's checkout differently.
+        python3 "${FORGEJO_ACTION_PATH:-$GITHUB_ACTION_PATH}/app_deploy.py"
