@@ -10,9 +10,11 @@ deploys a pushed container image digest through the Gandalf gateway.
 3. It records the deployment and notifies the node the app is placed on.
 4. The node applies it: backup gate, pull, restart, health check, and rollback on
    failure.
-5. This action follows the deployment and prints the node's progress.
+5. This action follows the deployment and prints the node's progress. While it waits, it
+   rides out a forge or gateway that can't be reached or answers 429/5xx (with one warning
+   per outage), since the deployment goes on without it.
 6. It fails the job when the deployment is rolled back, fails, or gets no result within
-   `timeout`.
+   `timeout`. A refused request (4xx) fails it at once.
 
 A newer deployment of the same app that supersedes this one ends the job with a notice.
 

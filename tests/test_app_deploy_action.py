@@ -15,7 +15,7 @@ IMAGE = f"forge.example/eric/notes@sha256:{'a' * 64}"
 
 
 class FakeGateway:
-    """Answers the start and then the given statuses, one per poll."""
+    """Answers the start and then the given statuses, one per poll (an exception is raised)."""
 
     def __init__(self, statuses, notified=True):
         self.statuses = list(statuses)
@@ -25,6 +25,8 @@ class FakeGateway:
     def __call__(self, gateway, path, token, body=None):
         self.requests.append((path, token, body))
         status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        if isinstance(status, Exception):
+            raise status
         detail = {"applying": "pulling", "rolled_back": "not healthy after 120 s"}.get(status)
         return {
             "deployment": {
@@ -93,6 +95,46 @@ def test_waiting_ends_with_the_timeout():
     code, _gateway, lines = run(["pending"], timeout=10)
     assert code == 1
     assert lines[-1].startswith("::error::no result from citadel after 10 s")
+
+
+def test_a_passing_outage_while_waiting_is_waited_out():
+    down = app_deploy.TransientError("Gandalf could not be reached: [Errno 101] Network is unreachable")
+    code, _gateway, lines = run(["pending", down, down, app_deploy.TransientError("HTTP 502"), "live"])
+    assert code == 0
+    # One warning per outage, then the progress goes on.
+    assert [line for line in lines if line.startswith("::warning::")] == [
+        "::warning::Gandalf could not be reached: [Errno 101] Network is unreachable; still waiting"
+    ]
+    assert lines[-1] == "live"
+
+
+def test_an_outage_that_outlasts_the_deadline_fails():
+    down = app_deploy.TransientError("Gandalf could not be reached: timed out")
+    code, _gateway, lines = run(["pending", down], timeout=10)
+    assert code == 1
+    assert lines[-1].startswith("::error::no result from citadel after 10 s")
+
+
+def test_a_refusal_while_waiting_still_fails():
+    with pytest.raises(app_deploy.DeployError, match="HTTP 403") as caught:
+        run(["pending", app_deploy._http_error("Gandalf GET /v1/apps/notes/deployments/d-1 failed", 403)])
+    assert not isinstance(caught.value, app_deploy.TransientError)
+
+
+@pytest.mark.parametrize("code, transient", [(400, False), (401, False), (403, False), (429, True), (502, True), (503, True)])
+def test_http_errors_are_transient_only_when_retrying_can_help(code, transient):
+    assert isinstance(app_deploy._http_error("x", code), app_deploy.TransientError) is transient
+
+
+def test_an_unreachable_token_endpoint_is_transient(monkeypatch):
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://forge.example/token")
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "t")
+
+    def unreachable(_request, timeout):
+        raise app_deploy.urllib.error.URLError(OSError(101, "Network is unreachable"))
+
+    with pytest.raises(app_deploy.TransientError, match="Network is unreachable"):
+        app_deploy.request_identity_token("https://g", unreachable)
 
 
 def test_an_unnotified_node_is_mentioned():

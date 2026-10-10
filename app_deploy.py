@@ -29,6 +29,15 @@ class DeployError(Exception):
     pass
 
 
+class TransientError(DeployError):
+    """A request that may work when tried again: no connection, a timeout, or HTTP 429/5xx."""
+
+
+def _http_error(prefix: str, code: int, message: str = "") -> DeployError:
+    kind = TransientError if code == 429 or code >= 500 else DeployError
+    return kind(f"{prefix}: HTTP {code}{': ' + message if message else ''}")
+
+
 def request_identity_token(audience: str, opener=urllib.request.urlopen) -> str:
     """The running workflow's OIDC identity token, from Forgejo or GitHub."""
     url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
@@ -48,8 +57,10 @@ def request_identity_token(audience: str, opener=urllib.request.urlopen) -> str:
             value = json.loads(response.read()).get("value")
     except urllib.error.HTTPError as exc:
         exc.read()
-        raise DeployError(f"the workflow identity token could not be requested: HTTP {exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, ValueError, AttributeError) as exc:
+        raise _http_error("the workflow identity token could not be requested", exc.code) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise TransientError(f"the workflow identity token could not be requested: {exc}") from exc
+    except (ValueError, AttributeError) as exc:
         raise DeployError(f"the workflow identity token could not be requested: {exc}") from exc
     if not isinstance(value, str) or not value:
         raise DeployError("the CI provider returned no identity token")
@@ -82,9 +93,11 @@ def gateway_request(
             message = str(json.loads(detail).get("error") or "")
         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
             message = ""
-        raise DeployError(f"Gandalf {request.method} {path} failed: HTTP {exc.code}{': ' + message if message else ''}") from exc
+        raise _http_error(f"Gandalf {request.method} {path} failed", exc.code, message) from exc
     except urllib.error.URLError as exc:
-        raise DeployError(f"Gandalf could not be reached: {exc.reason}") from exc
+        raise TransientError(f"Gandalf could not be reached: {exc.reason}") from exc
+    except (TimeoutError, OSError) as exc:
+        raise TransientError(f"Gandalf could not be reached: {exc}") from exc
 
 
 def deploy(
@@ -122,6 +135,7 @@ def deploy(
     deadline = clock() + timeout
     seen = None
     current = started
+    unreachable = False
     while True:
         status, detail = current["status"], current.get("detail")
         if (status, detail) != seen:
@@ -133,10 +147,19 @@ def deploy(
             log(f"::error::no result from {started['node']} after {int(timeout)} s (status {status})")
             return 1
         sleep(POLL_SECONDS)
-        # A fresh identity token for each request: they expire within minutes.
-        current = call(
-            gateway, f"/v1/apps/{service}/deployments/{deployment_id}", identity(audience)
-        )["deployment"]
+        # A fresh identity token for each request: they expire within minutes. The
+        # deployment goes on without us, so a passing outage (the forge or the gateway
+        # restarting, say) only delays the answer until the deadline.
+        try:
+            current = call(
+                gateway, f"/v1/apps/{service}/deployments/{deployment_id}", identity(audience)
+            )["deployment"]
+        except TransientError as exc:
+            if not unreachable:
+                log(f"::warning::{exc}; still waiting")
+            unreachable = True
+            continue
+        unreachable = False
     if status == "live":
         return 0
     if status == "superseded":
